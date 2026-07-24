@@ -50,7 +50,7 @@ class QQMusicApi(
             reqKey = "music.search.SearchCgiService.DoSearchForQQMusicDesktop",
             overrideComm = mapOf("ct" to "6", "cv" to "80600", "tmeAppID" to "qqmusic"),
         )
-        val list = data.getAsJsonObject("body")?.getAsJsonObject("song")?.getAsJsonArray("list") ?: return emptyList()
+        val list = data.objOrNull("body")?.objOrNull("song")?.arrOrNull("list") ?: return emptyList()
         MusicLog.info("QQ search '$keyword': got ${list.size()} 首")
         return list.mapNotNull { runCatching { parseTrack(it.asJsonObject) }.getOrNull() }
     }
@@ -62,10 +62,10 @@ class QQMusicApi(
             param = mapOf("From" to 0, "Size" to size),
             reqKey = "req", overrideComm = mapOf("ct" to "24", "cv" to "0"),
         )
-        val list = data.getAsJsonArray("List") ?: return emptyList()
+        val list = data.arrOrNull("List") ?: return emptyList()
         return list.mapNotNull { el ->
-            val basic = el.asJsonObject.getAsJsonObject("Playlist")?.getAsJsonObject("basic") ?: return@mapNotNull null
-            val cover = basic.getAsJsonObject("cover")
+            val basic = el.asJsonObject.objOrNull("Playlist")?.objOrNull("basic") ?: return@mapNotNull null
+            val cover = basic.objOrNull("cover")
             MusicPlaylist(
                 source = MusicSource.QQ,
                 id = basic.get("tid")?.takeIf { !it.isJsonNull }?.asString ?: return@mapNotNull null,
@@ -83,7 +83,7 @@ class QQMusicApi(
             param = mapOf("disstid" to (dissid.toLongOrNull() ?: 0L), "onlysong" to 0, "song_begin" to 0, "song_num" to num),
             reqKey = "req", overrideComm = mapOf("ct" to "24", "cv" to "0"),
         )
-        val list = data.getAsJsonArray("songlist") ?: return emptyList()
+        val list = data.arrOrNull("songlist") ?: return emptyList()
         return list.mapNotNull { runCatching { parseTrack(it.asJsonObject) }.getOrNull() }
     }
 
@@ -97,7 +97,7 @@ class QQMusicApi(
             method = "GetDetail",
             param = mapOf("topId" to topId, "offset" to 0, "num" to num),
         )
-        val list = data.getAsJsonArray("songInfoList") ?: return emptyList()
+        val list = data.arrOrNull("songInfoList") ?: return emptyList()
         MusicLog.info("QQ toplist $topId: ${list.size()} 首")
         return list.mapNotNull { runCatching { parseTrack(it.asJsonObject) }.getOrNull() }
     }
@@ -118,9 +118,9 @@ class QQMusicApi(
             cookies = credentialCookies(),
         )
         val djson = runCatching { gson.fromJson(detail.body, JsonObject::class.java) }.getOrNull()
-        val song = djson?.getAsJsonArray("data")?.firstOrNull()?.asJsonObject
+        val song = djson?.arrOrNull("data")?.firstOrNull()?.asJsonObject
             ?: return SongUrl(null, quality, reason = "获取歌曲信息失败")
-        val file = song.getAsJsonObject("file")
+        val file = song.objOrNull("file")
         val mediaMid = file?.get("media_mid")?.takeIf { !it.isJsonNull }?.asString ?: mid
         val songType = song.get("type")?.takeIf { !it.isJsonNull }?.asInt ?: 0
 
@@ -148,8 +148,8 @@ class QQMusicApi(
             "loginflag" to 1,
             "platform" to "20",
         ))
-        val infos = data.getAsJsonArray("midurlinfo")
-        val sip = (data.getAsJsonArray("sip")?.firstOrNull()?.asString ?: "https://dl.stream.qqmusic.qq.com/")
+        val infos = data.arrOrNull("midurlinfo")
+        val sip = (data.arrOrNull("sip")?.firstOrNull()?.asString ?: "https://dl.stream.qqmusic.qq.com/")
             .replaceFirst("http://", "https://") // 避免混合内容被拦
         for (i in cands.indices) {
             val purl = infos?.get(i)?.asJsonObject?.get("purl")?.takeIf { !it.isJsonNull }?.asString
@@ -213,7 +213,7 @@ class QQMusicApi(
         )
         val text = resp.body.let { if (it.startsWith("callback(") || it.contains(")(")) it.substringAfter('(').substringBeforeLast(')') else it }
         val json = runCatching { gson.fromJson(text, JsonObject::class.java) }.getOrNull()
-        val creator = json?.getAsJsonObject("data")?.getAsJsonObject("creator")
+        val creator = json?.objOrNull("data")?.objOrNull("creator")
         var nick = creator?.get("nick")?.takeIf { !it.isJsonNull }?.asString ?: "QQ用户$musicid"
         // 昵称可能是 base64（多为中文名）。仅当解码结果是干净文本时才采用，
         // 否则像 "SuperSkidder" 这类普通名会被误解码成乱码。
@@ -408,7 +408,7 @@ class QQMusicApi(
         val req = json.getAsJsonObject(reqKey) ?: throw MusicApiException("QQ：响应缺少 $reqKey")
         val code = req.get("code")?.asInt ?: -1
         if (code != 0) throw MusicApiException("QQ：接口返回 code=$code ($module.$method)")
-        return req.getAsJsonObject("data") ?: JsonObject()
+        return req.objOrNull("data") ?: JsonObject()
     }
 
     /** vkey 请求：GET musicu.fcg?data=<payload>，payload 仅 req_0、无 comm、不签名。 */
@@ -424,7 +424,7 @@ class QQMusicApi(
             cookies = credentialCookies(),
         )
         val json = gson.fromJson(resp.body, JsonObject::class.java) ?: return JsonObject()
-        return json.getAsJsonObject("req_0")?.getAsJsonObject("data") ?: JsonObject()
+        return json.objOrNull("req_0")?.objOrNull("data") ?: JsonObject()
     }
 
     private fun buildComm(extra: Map<String, Any>): Map<String, Any> {
@@ -453,10 +453,10 @@ class QQMusicApi(
     private fun parseTrack(o: JsonObject): Track {
         val mid = (o.get("mid") ?: o.get("songmid"))?.takeIf { !it.isJsonNull }?.asString
         val id = (o.get("id") ?: o.get("songid"))?.takeIf { !it.isJsonNull }?.asString ?: (mid ?: "")
-        val singers = o.getAsJsonArray("singer")
+        val singers = o.arrOrNull("singer")
             ?.mapNotNull { it.asJsonObject.get("name")?.asString }
             ?.joinToString(" / ") ?: ""
-        val album = o.getAsJsonObject("album")
+        val album = o.objOrNull("album")
         val albumName = album?.get("name")?.takeIf { !it.isJsonNull }?.asString
             ?: o.get("albumname")?.takeIf { !it.isJsonNull }?.asString ?: ""
         // 封面优先用 album.pmid（专辑图专用 mid），无则用 album.mid
@@ -465,7 +465,7 @@ class QQMusicApi(
             ?: o.get("albummid")?.takeIf { !it.isJsonNull }?.asString
         val interval = o.get("interval")?.takeIf { !it.isJsonNull }?.asLong ?: 0
         // 只有 pay_play==1 才是"付费才能播"（VIP）；pay_month/pay_down 免费歌也可能为 1
-        val vip = o.getAsJsonObject("pay")?.get("pay_play")?.takeIf { !it.isJsonNull }?.asInt == 1
+        val vip = o.objOrNull("pay")?.get("pay_play")?.takeIf { !it.isJsonNull }?.asInt == 1
         return Track(
             source = MusicSource.QQ,
             id = id,

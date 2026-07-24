@@ -7,7 +7,7 @@ plugins {
 }
 
 group = "top.fpsmaster"
-version = "0.1.0"
+version = "0.1.1"
 
 dependencies {
     // 唯一的第三方运行时依赖：Gson（JSON 解析）。其余全部走 JDK 内置。

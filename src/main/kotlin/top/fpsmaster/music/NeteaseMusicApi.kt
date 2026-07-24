@@ -33,7 +33,7 @@ class NeteaseMusicApi(
             "/weapi/cloudsearch/get/web",
             mapOf("s" to keyword, "type" to "1", "limit" to limit.toString(), "offset" to offset.toString(), "total" to "true"),
         )
-        val songs = data.getAsJsonObject("result")?.getAsJsonArray("songs") ?: return emptyList()
+        val songs = data.objOrNull("result")?.arrOrNull("songs") ?: return emptyList()
         return songs.mapNotNull { runCatching { parseTrack(it.asJsonObject) }.getOrNull() }
     }
 
@@ -48,13 +48,13 @@ class NeteaseMusicApi(
             "/weapi/song/enhance/player/url/v1",
             mapOf("ids" to "[${track.id}]", "level" to level, "encodeType" to "flac"),
         )
-        val item = data.getAsJsonArray("data")?.firstOrNull()?.asJsonObject
+        val item = data.arrOrNull("data")?.firstOrNull()?.asJsonObject
             ?: return SongUrl(null, quality)
         val url = item.get("url")?.takeIf { !it.isJsonNull }?.asString
         val type = item.get("type")?.takeIf { !it.isJsonNull }?.asString ?: ""
         val size = item.get("size")?.takeIf { !it.isJsonNull }?.asLong ?: 0
         // freeTrialInfo 非空 => 该链接是试听片段（start/end 单位为秒）
-        val trial = item.getAsJsonObject("freeTrialInfo")?.takeIf { !it.isJsonNull }
+        val trial = item.objOrNull("freeTrialInfo")?.takeIf { !it.isJsonNull }
         return if (trial != null) {
             val start = trial.get("start")?.takeIf { !it.isJsonNull }?.asLong ?: 0
             val end = trial.get("end")?.takeIf { !it.isJsonNull }?.asLong ?: 0
@@ -75,9 +75,9 @@ class NeteaseMusicApi(
             "/weapi/song/lyric",
             mapOf("id" to track.id, "lv" to "-1", "kv" to "-1", "tv" to "-1", "yv" to "-1"),
         )
-        val lrc = data.getAsJsonObject("lrc")?.get("lyric")?.takeIf { !it.isJsonNull }?.asString ?: ""
-        val tlyric = data.getAsJsonObject("tlyric")?.get("lyric")?.takeIf { !it.isJsonNull }?.asString?.ifBlank { null }
-        val yrc = data.getAsJsonObject("yrc")?.get("lyric")?.takeIf { !it.isJsonNull }?.asString?.ifBlank { null }
+        val lrc = data.objOrNull("lrc")?.get("lyric")?.takeIf { !it.isJsonNull }?.asString ?: ""
+        val tlyric = data.objOrNull("tlyric")?.get("lyric")?.takeIf { !it.isJsonNull }?.asString?.ifBlank { null }
+        val yrc = data.objOrNull("yrc")?.get("lyric")?.takeIf { !it.isJsonNull }?.asString?.ifBlank { null }
         return Lyric(lrc, tlyric, yrc, LyricParser.parse(lrc, tlyric, yrc))
     }
 
@@ -118,13 +118,13 @@ class NeteaseMusicApi(
     /** 是否已登录，返回用户 id（未登录为 null）。 */
     fun getLoginUid(): Long? {
         val data = weapi("/weapi/w/nuser/account/get", emptyMap())
-        return data.getAsJsonObject("account")?.get("id")?.takeIf { !it.isJsonNull }?.asLong
+        return data.objOrNull("account")?.get("id")?.takeIf { !it.isJsonNull }?.asLong
     }
 
     /** 每日推荐歌曲（需登录）。 */
     fun getDailyRecommendSongs(): List<Track> {
         val data = weapi("/weapi/v3/discovery/recommend/songs", emptyMap())
-        val songs = data.getAsJsonObject("data")?.getAsJsonArray("dailySongs") ?: return emptyList()
+        val songs = data.objOrNull("data")?.arrOrNull("dailySongs") ?: return emptyList()
         return songs.mapNotNull { runCatching { parseTrack(it.asJsonObject) }.getOrNull() }
     }
 
@@ -134,7 +134,7 @@ class NeteaseMusicApi(
             "/weapi/user/playlist",
             mapOf("uid" to uid.toString(), "limit" to limit.toString(), "offset" to offset.toString(), "includeVideo" to "true"),
         )
-        val list = data.getAsJsonArray("playlist") ?: return emptyList()
+        val list = data.arrOrNull("playlist") ?: return emptyList()
         return list.mapNotNull {
             val o = it.asJsonObject
             PlaylistBrief(
@@ -152,7 +152,7 @@ class NeteaseMusicApi(
             "/weapi/v6/playlist/detail",
             mapOf("id" to playlistId, "n" to limit.toString(), "s" to "8"),
         )
-        val tracks = data.getAsJsonObject("playlist")?.getAsJsonArray("tracks") ?: return emptyList()
+        val tracks = data.objOrNull("playlist")?.arrOrNull("tracks") ?: return emptyList()
         return tracks.mapNotNull { runCatching { parseTrack(it.asJsonObject) }.getOrNull() }
     }
 
@@ -163,10 +163,10 @@ class NeteaseMusicApi(
     // ---- 内部 ----
 
     private fun parseTrack(o: JsonObject): Track {
-        val artists = (o.getAsJsonArray("ar") ?: o.getAsJsonArray("artists"))
+        val artists = (o.arrOrNull("ar") ?: o.arrOrNull("artists"))
             ?.mapNotNull { it.asJsonObject.get("name")?.asString }
             ?.joinToString(" / ") ?: ""
-        val albumObj = o.getAsJsonObject("al") ?: o.getAsJsonObject("album")
+        val albumObj = o.objOrNull("al") ?: o.objOrNull("album")
         // fee: 0=免费, 1=VIP专享, 4=数字专辑(需购买), 8=免费低音质/高音质需VIP。
         // 除 0 外都需要相应权限才能完整播放。
         val fee = o.get("fee")?.takeIf { !it.isJsonNull }?.asInt ?: 0
