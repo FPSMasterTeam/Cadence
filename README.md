@@ -122,27 +122,33 @@ MusicLog.logger = object : MusicLogger {
 | 手动 Cookie 登录 | 直接赋值 `netease.cookie` | 直接赋值 `qq.musicid`/`qq.musicKey` |
 | 每日推荐 / 用户歌单 / 歌单详情 | ✅ | 排行榜 / 推荐歌单 / 歌单详情 ✅ |
 
-## 构建
+## 引用（JitPack）
 
-```bash
-./gradlew build                 # 编译 + 跑歌词解析单测（输出 Java 8 字节码）
-./gradlew publishToMavenLocal   # 装到本地 mavenLocal，供其它 mod 依赖
-```
-
-其它项目引用，二选一：
-
-**A. JitPack（公开、无需本地构建）**
+本库由 [JitPack](https://jitpack.io/#FPSMasterTeam/Cadence) 托管，**不需要**本地构建或发布：
 
 ```kotlin
 repositories { maven("https://jitpack.io") }
-dependencies { implementation("com.github.FPSMasterTeam:Cadence:v0.1.0") }
+dependencies { implementation("com.github.FPSMasterTeam:Cadence:v0.1.1") }
 ```
 
-**B. 本地 mavenLocal（离线/开发）**
+版本号就是 git tag（带 `v` 前缀）。JitPack 会在首次拉取时按 `jitpack.yml` 现场构建并把坐标
+重写成 `com.github.FPSMasterTeam:Cadence:<tag>`（源码包名仍是 `top.fpsmaster.music.*`，
+本地 `publishToMavenLocal` 的坐标仍是 `top.fpsmaster:music-api`）。
 
-```kotlin
-repositories { mavenLocal() }
-dependencies { implementation("top.fpsmaster:music-api:0.1.0") }
+**发新版**：改 `build.gradle.kts` 里的 `version` → 提交 → 打 tag 并推送，即可被引用：
+
+```bash
+git tag v0.1.2 && git push origin v0.1.2
+```
+
+已知消费方：**FPSMaster-Edge**（1.8.9 / Forge，shadow 进 jar）、**FPSMaster-Nova**
+（Fabric 多版本，bundle 进 jar）。两边都不打传递依赖——gson 由 MC 提供，kotlin-stdlib 各自单独引。
+
+## 构建（开发本库时）
+
+```bash
+./gradlew build                 # 编译 + 跑歌词解析单测（输出 Java 8 字节码）
+./gradlew publishToMavenLocal   # 装到本地 mavenLocal（top.fpsmaster:music-api），仅本地联调用
 ```
 
 > 从 Java 调用完全可行（Kotlin 编译为普通 JVM 类），运行期需要 `kotlin-stdlib` 在 classpath 上。
