@@ -100,6 +100,20 @@ store.setNetease(music.netease.cookie)
 store.setQq(music.qq.musicid, music.qq.musicKey)
 ```
 
+## 错误处理
+
+所有公开方法失败时只抛 `MusicApiException`，用 `kind`（`MusicErrorKind`）区分原因，`platformCode` 是平台原始业务码：
+
+| kind | 含义 | 建议界面 |
+|---|---|---|
+| `NOT_LOGGED_IN` | 网易云 code=301、QQ code=1000：未登录或登录过期 | 切回未登录，提示重新扫码 |
+| `RISK_CONTROL` | 网易云 -460/-461/-462/405：风控、需验证、操作频繁 | 提示稍后再试 |
+| `NETWORK` / `TIMEOUT` | 连接失败 / 超过单次请求总时限（默认 30 秒） | 「重试」按钮 |
+| `BAD_RESPONSE` | 非 JSON、空 body、结构不符、响应体超过上限 | 显示错误信息 |
+| `API_ERROR` | 其它业务错误码 | 显示错误信息 |
+
+`netease.getLoginUid()` 在 cookie 失效时返回 `null`，可用来校验持久化回来的登录态。
+
 ## 接管日志（可选）
 
 ```kotlin
@@ -109,7 +123,7 @@ MusicLog.logger = object : MusicLogger {
 }
 ```
 
-默认无操作，不打印任何东西。
+默认无操作，不打印任何东西。凭证、cookie 值、搜索词不会出现在 info 及以上级别的日志里。
 
 ## 功能矩阵
 
@@ -128,7 +142,7 @@ MusicLog.logger = object : MusicLogger {
 
 ```kotlin
 repositories { maven("https://jitpack.io") }
-dependencies { implementation("com.github.FPSMasterTeam:Cadence:v0.1.1") }
+dependencies { implementation("com.github.FPSMasterTeam:Cadence:v0.1.2") }
 ```
 
 版本号就是 git tag（带 `v` 前缀）。JitPack 会在首次拉取时按 `jitpack.yml` 现场构建并把坐标
@@ -138,7 +152,7 @@ dependencies { implementation("com.github.FPSMasterTeam:Cadence:v0.1.1") }
 **发新版**：改 `build.gradle.kts` 里的 `version` → 提交 → 打 tag 并推送，即可被引用：
 
 ```bash
-git tag v0.1.2 && git push origin v0.1.2
+git tag v0.1.3 && git push origin v0.1.3
 ```
 
 已知消费方：**FPSMaster-Edge**（1.8.9 / Forge，shadow 进 jar）、**FPSMaster-Nova**
