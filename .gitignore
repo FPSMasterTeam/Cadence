@@ -4,3 +4,4 @@ build/
 *.log
 .idea/
 .DS_Store
+bin/
