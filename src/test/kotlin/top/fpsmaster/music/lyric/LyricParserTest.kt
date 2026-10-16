@@ -113,4 +113,22 @@ class LyricParserTest {
         assertTrue(LyricParser.parse("").isEmpty())
         assertTrue(LyricParser.parse("   ", yrc = "  ").isEmpty())
     }
+
+    @Test
+    fun `yrc keeps words that are or start with an opening parenthesis`() {
+        val yrc = "[1000,1000](1000,300,0)Hold (1300,100,0)((1400,200,0)ooh(1600,100,0)) (1700,300,0)me"
+        val line = LyricParser.parse(lrc = null, yrc = yrc).single()
+        assertEquals("Hold (ooh) me", line.text)
+        assertEquals(listOf("Hold ", "(", "ooh", ") ", "me"), line.words.map { it.text })
+        assertEquals(LyricWord(1300, 100, "("), line.words[1])
+    }
+
+    @Test
+    fun `translation goes to the nearest timestamp within tolerance`() {
+        // 两条翻译都在 500ms 内：应取差值最小的 3.30，而不是先出现的 2.60
+        val lrc = "[00:03.20]Line"
+        val tlyric = "[00:02.80]远的\n[00:03.30]近的"
+        val lines = LyricParser.parse(lrc, translated = tlyric)
+        assertEquals("近的", lines[0].translation)
+    }
 }

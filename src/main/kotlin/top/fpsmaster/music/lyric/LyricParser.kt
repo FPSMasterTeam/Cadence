@@ -25,7 +25,9 @@ object LyricParser {
 
     // YRC 行：[起点ms,时长ms]后跟若干 (字起点,字时长,0)字
     private val YRC_LINE = Regex("""^\[(\d+),(\d+)](.*)$""")
-    private val YRC_WORD = Regex("""\((\d+),(\d+),(\d+)\)([^(]+)""")
+    // 只匹配时间戳；字文本取到下一个时间戳为止。不能用 `([^(]+)` 匹配文本：
+    // 和声歌词里的字本身可以是「(」或以「(」开头（如 `(1400,200,0)(`），那样会被整段跳过。
+    private val YRC_STAMP = Regex("""\((\d+),(\d+),(\d+)\)""")
 
     // LRC 时间戳：[mm:ss.xx] / [mm:ss] / [mm:ss:xx]（分/秒位数放宽）
     private val LRC_TIME = Regex("""\[(\d{1,3}):(\d{1,2}(?:[.:]\d{1,3})?)]""")
@@ -65,7 +67,9 @@ object LyricParser {
 
         return withDuration.map { line ->
             val t = transMap[line.startMs]
-                ?: transMap.entries.firstOrNull { abs(it.key - line.startMs) < 500 }?.value
+                ?: transMap.entries
+                    .filter { abs(it.key - line.startMs) < 500 }
+                    .minByOrNull { abs(it.key - line.startMs) }?.value
             if (t != null) line.copy(translation = t) else line
         }
     }
@@ -95,10 +99,13 @@ object LyricParser {
 
             val words = ArrayList<LyricWord>()
             val sb = StringBuilder()
-            for (w in YRC_WORD.findAll(rest)) {
+            val stamps = YRC_STAMP.findAll(rest).toList()
+            for ((i, w) in stamps.withIndex()) {
+                val textEnd = if (i + 1 < stamps.size) stamps[i + 1].range.first else rest.length
+                val wText = rest.substring(w.range.last + 1, textEnd)
+                if (wText.isEmpty()) continue
                 val wStart = w.groupValues[1].toLong()
                 val wDur = w.groupValues[2].toLong()
-                val wText = w.groupValues[4]
                 words.add(LyricWord(wStart, wDur, wText))
                 sb.append(wText)
             }
