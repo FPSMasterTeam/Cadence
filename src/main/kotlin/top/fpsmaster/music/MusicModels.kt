@@ -168,5 +168,39 @@ data class QQUserInfo(
     val avatarUrl: String,
 )
 
-/** 音乐 API 调用异常。 */
-class MusicApiException(message: String, cause: Throwable? = null) : RuntimeException(message, cause)
+/**
+ * 音乐 API 失败的分类。宿主按它决定界面：[NOT_LOGGED_IN] 切回未登录并提示重新扫码，
+ * [RISK_CONTROL] 提示稍后再试，[NETWORK]/[TIMEOUT] 给「重试」，其余显示错误信息。
+ */
+enum class MusicErrorKind {
+    /** 连接失败、连接被重置等网络层错误。 */
+    NETWORK,
+
+    /** 超过单次请求总时限。 */
+    TIMEOUT,
+
+    /** 平台判定未登录或登录已过期（网易云 code=301 等）。 */
+    NOT_LOGGED_IN,
+
+    /** 平台风控 / 需要安全验证 / 操作过于频繁（网易云 -460、-462、405 等）。 */
+    RISK_CONTROL,
+
+    /** 响应不是预期的 JSON 结构（HTML 错误页、空 body、字段缺失等）。 */
+    BAD_RESPONSE,
+
+    /** 平台返回了明确的业务错误码。 */
+    API_ERROR,
+}
+
+/**
+ * 音乐 API 调用异常。本库公开方法遇到网络、解析、业务错误时都抛这一种异常，宿主只需捕获它。
+ *
+ * @param kind         失败分类，见 [MusicErrorKind]。
+ * @param platformCode 平台原始业务码（如网易云 301、QQ 的 req.code），没有时为 null。
+ */
+class MusicApiException @JvmOverloads constructor(
+    message: String,
+    cause: Throwable? = null,
+    val kind: MusicErrorKind = MusicErrorKind.API_ERROR,
+    val platformCode: Int? = null,
+) : RuntimeException(message, cause)

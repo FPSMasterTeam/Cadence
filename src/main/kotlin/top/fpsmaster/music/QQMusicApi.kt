@@ -8,6 +8,7 @@ import top.fpsmaster.music.http.MusicHttp
 import top.fpsmaster.music.lyric.LyricParser
 import java.util.Base64
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * QQ 音乐客户端。走 web 端 `u.y.qq.com/cgi-bin/musicu.fcg`(不签名) / `musics.fcg`(zzc 签名)。
@@ -19,6 +20,11 @@ import java.util.UUID
  *
  * 说明：QQ 的扫码登录（ptlogin）参数会随腾讯改版漂移，上线前务必真机联调；
  * 若某天登录失效，优先核对 [createQrCode]/[checkQrCode] 里的 aid/daid/pt_3rd_aid 等常量。
+ *
+ * 线程安全性：凭证字段对多线程可见；每次 [createQrCode] 新建一个独立的登录会话（cookie jar），
+ * 对同一张二维码的 [checkQrCode] 串行执行，刷新二维码不会和仍在请求中的旧轮询共用 jar。
+ *
+ * 错误：所有方法失败时抛 [MusicApiException]，按 [MusicApiException.kind] 区分。
  */
 class QQMusicApi(
     private val http: MusicHttp = MusicHttp(),
@@ -27,14 +33,25 @@ class QQMusicApi(
     // 数字 guid（对齐 Meting：Math.random()*1e10），QQ vkey 会按此绑定凭证
     private val guid: String = (1_000_000_000L + kotlin.random.Random.nextLong(9_000_000_000L)).toString()
 
+    @Volatile
     var musicid: String = ""
+    @Volatile
     var musicKey: String = ""
 
     val loggedIn: Boolean get() = musicid.isNotEmpty() && musicKey.isNotEmpty()
 
-    // 整个登录流程共享的 cookie jar（模拟浏览器 Session，跨 ptqrshow/ptqrlogin/
-    // check_sig/authorize 累积，合并时跳过空值——这是拿到 code 的关键）。
-    private val loginJar = LinkedHashMap<String, String>()
+    /**
+     * 一次扫码登录的会话：cookie jar 模拟浏览器 Session，跨 ptqrshow/ptqrlogin/check_sig/authorize
+     * 累积，合并时跳过空值——这是拿到 code 的关键。每张二维码一个实例，旧轮询线程手里的会话
+     * 不会被新二维码清空或混入。
+     */
+    private class LoginSession {
+        val jar = LinkedHashMap<String, String>()
+        var qrsig: String = ""
+    }
+
+    @Volatile
+    private var loginSession: LoginSession? = null
 
     // ---- 公开 API ----
 
@@ -51,8 +68,8 @@ class QQMusicApi(
             overrideComm = mapOf("ct" to "6", "cv" to "80600", "tmeAppID" to "qqmusic"),
         )
         val list = data.objOrNull("body")?.objOrNull("song")?.arrOrNull("list") ?: return emptyList()
-        MusicLog.info("QQ search '$keyword': got ${list.size()} 首")
-        return list.mapNotNull { runCatching { parseTrack(it.asJsonObject) }.getOrNull() }
+        MusicLog.debug("QQ search: got ${list.size()} 首")
+        return parseTracks(list)
     }
 
     /** 推荐歌单（发现页）。 */
@@ -64,14 +81,14 @@ class QQMusicApi(
         )
         val list = data.arrOrNull("List") ?: return emptyList()
         return list.mapNotNull { el ->
-            val basic = el.asJsonObject.objOrNull("Playlist")?.objOrNull("basic") ?: return@mapNotNull null
+            val basic = el.asObjOrNull()?.objOrNull("Playlist")?.objOrNull("basic") ?: return@mapNotNull null
             val cover = basic.objOrNull("cover")
             MusicPlaylist(
                 source = MusicSource.QQ,
-                id = basic.get("tid")?.takeIf { !it.isJsonNull }?.asString ?: return@mapNotNull null,
-                name = basic.get("title")?.takeIf { !it.isJsonNull }?.asString ?: "",
-                coverUrl = (cover?.get("medium_url") ?: cover?.get("small_url"))?.takeIf { !it.isJsonNull }?.asString,
-                trackCount = basic.get("song_cnt")?.takeIf { !it.isJsonNull }?.asInt ?: 0,
+                id = basic.get("tid").strOrNull() ?: return@mapNotNull null,
+                name = basic.get("title").strOrNull() ?: "",
+                coverUrl = cover?.get("medium_url").strOrNull() ?: cover?.get("small_url").strOrNull(),
+                trackCount = basic.get("song_cnt").intOrNull() ?: 0,
             )
         }
     }
@@ -84,7 +101,7 @@ class QQMusicApi(
             reqKey = "req", overrideComm = mapOf("ct" to "24", "cv" to "0"),
         )
         val list = data.arrOrNull("songlist") ?: return emptyList()
-        return list.mapNotNull { runCatching { parseTrack(it.asJsonObject) }.getOrNull() }
+        return parseTracks(list)
     }
 
     /**
@@ -98,8 +115,8 @@ class QQMusicApi(
             param = mapOf("topId" to topId, "offset" to 0, "num" to num),
         )
         val list = data.arrOrNull("songInfoList") ?: return emptyList()
-        MusicLog.info("QQ toplist $topId: ${list.size()} 首")
-        return list.mapNotNull { runCatching { parseTrack(it.asJsonObject) }.getOrNull() }
+        MusicLog.debug("QQ toplist $topId: ${list.size()} 首")
+        return parseTracks(list)
     }
 
     /**
@@ -117,12 +134,12 @@ class QQMusicApi(
             headers = mapOf("Referer" to "https://y.qq.com/"),
             cookies = credentialCookies(),
         )
-        val djson = runCatching { gson.fromJson(detail.body, JsonObject::class.java) }.getOrNull()
-        val song = djson?.arrOrNull("data")?.firstOrNull()?.asJsonObject
+        val djson = runCatching { gson.parseObject(detail.body, "QQ 歌曲详情") }.getOrNull()
+        val song = djson?.arrOrNull("data")?.firstOrNull().asObjOrNull()
             ?: return SongUrl(null, quality, reason = "获取歌曲信息失败")
         val file = song.objOrNull("file")
-        val mediaMid = file?.get("media_mid")?.takeIf { !it.isJsonNull }?.asString ?: mid
-        val songType = song.get("type")?.takeIf { !it.isJsonNull }?.asInt ?: 0
+        val mediaMid = file?.get("media_mid").strOrNull() ?: mid
+        val songType = song.get("type").intOrNull() ?: 0
 
         // 2. 按请求档位由高到低构造候选音质（只保留该歌确实有的文件）
         data class QCand(val sizeKey: String, val prefix: String, val ext: String, val q: AudioQuality)
@@ -134,7 +151,7 @@ class QQMusicApi(
         )
         val start = when (quality) { AudioQuality.LOSSLESS -> 0; AudioQuality.HIGH -> 1; AudioQuality.STANDARD -> 2 }
         val cands = all.subList(start, all.size)
-            .filter { file != null && (file.get(it.sizeKey)?.takeIf { s -> !s.isJsonNull }?.asLong ?: 0L) > 0L }
+            .filter { file != null && (file.get(it.sizeKey).longOrNull() ?: 0L) > 0L }
         if (cands.isEmpty()) return SongUrl(null, quality, reason = "无可用音频")
 
         // 3. GetVkeyServer/CgiGetVkey：filename = prefix + media_mid + ext（一次请求所有候选音质）
@@ -149,25 +166,28 @@ class QQMusicApi(
             "platform" to "20",
         ))
         val infos = data.arrOrNull("midurlinfo")
-        val sip = (data.arrOrNull("sip")?.firstOrNull()?.asString ?: "https://dl.stream.qqmusic.qq.com/")
+        val sip = (data.arrOrNull("sip")?.firstOrNull().strOrNull() ?: "https://dl.stream.qqmusic.qq.com/")
             .replaceFirst("http://", "https://") // 避免混合内容被拦
+        // midurlinfo 条数可能少于候选音质数，按实际条数取，越界的候选视为不可用
+        val infoCount = infos?.size() ?: 0
         for (i in cands.indices) {
-            val purl = infos?.get(i)?.asJsonObject?.get("purl")?.takeIf { !it.isJsonNull }?.asString
+            if (i >= infoCount) break
+            val purl = infos?.get(i).asObjOrNull()?.get("purl").strOrNull()
             if (!purl.isNullOrEmpty()) {
-                MusicLog.info("QQ vkey $mid: ${cands[i].prefix} ok")
+                MusicLog.debug("QQ vkey $mid: ${cands[i].prefix} ok")
                 return SongUrl(sip + purl, cands[i].q, cands[i].ext)
             }
         }
         // 无 purl：按 result 码 / 标志位解析原因
-        val info0 = infos?.firstOrNull()?.asJsonObject
-        val result = info0?.get("result")?.takeIf { !it.isJsonNull }?.asInt ?: -1
-        val needBuy = info0?.get("pneedbuy")?.takeIf { !it.isJsonNull }?.asInt == 1
+        val info0 = infos?.firstOrNull().asObjOrNull()
+        val result = info0?.get("result").intOrNull() ?: -1
+        val needBuy = info0?.get("pneedbuy").intOrNull() == 1
         val reason = when {
             result == 104003 -> "需要绿钻会员（或无版权）"
             needBuy || track.vip -> "需要 QQ 音乐会员/付费"
             else -> "暂时无法播放"
         }
-        MusicLog.info("QQ vkey $mid: 无 purl, result=$result → $reason")
+        MusicLog.debug("QQ vkey $mid: 无 purl, result=$result → $reason")
         return SongUrl(null, quality, reason = reason)
     }
 
@@ -188,10 +208,10 @@ class QQMusicApi(
         val jsonText = resp.body.trim().let {
             if (it.startsWith("{")) it else it.substringAfter('(').substringBeforeLast(')')
         }
-        val json = runCatching { gson.fromJson(jsonText, JsonObject::class.java) }.getOrNull()
+        val json = runCatching { gson.parseObject(jsonText, "QQ 歌词") }.getOrNull()
             ?: return Lyric("")
         fun decode(field: String): String? {
-            val raw = json.get(field)?.takeIf { !it.isJsonNull }?.asString ?: return null
+            val raw = json.get(field).strOrNull() ?: return null
             if (raw.isBlank()) return null
             // nobase64=1 通常已是明文；个别情况仍是 base64，做一次兜底解码
             return runCatching { String(Base64.getDecoder().decode(raw), Charsets.UTF_8) }
@@ -212,9 +232,9 @@ class QQMusicApi(
             cookies = credentialCookies(),
         )
         val text = resp.body.let { if (it.startsWith("callback(") || it.contains(")(")) it.substringAfter('(').substringBeforeLast(')') else it }
-        val json = runCatching { gson.fromJson(text, JsonObject::class.java) }.getOrNull()
+        val json = runCatching { gson.parseObject(text, "QQ 用户信息") }.getOrNull()
         val creator = json?.objOrNull("data")?.objOrNull("creator")
-        var nick = creator?.get("nick")?.takeIf { !it.isJsonNull }?.asString ?: "QQ用户$musicid"
+        var nick = creator?.get("nick").strOrNull() ?: "QQ用户$musicid"
         // 昵称可能是 base64（多为中文名）。仅当解码结果是干净文本时才采用，
         // 否则像 "SuperSkidder" 这类普通名会被误解码成乱码。
         if (nick.matches(Regex("^[A-Za-z0-9+/]+={0,2}$")) && nick.length % 4 == 0) {
@@ -223,7 +243,7 @@ class QQMusicApi(
                 ?.let { nick = it }
         }
         // 头像用响应里的 headpic（真实头像），没有再回退到 qlogo
-        val headpic = creator?.get("headpic")?.takeIf { !it.isJsonNull }?.asString
+        val headpic = creator?.get("headpic").strOrNull()
         val avatar = headpic?.takeIf { it.isNotBlank() } ?: "https://q1.qlogo.cn/g?b=qq&nk=$musicid&s=100"
         return QQUserInfo(musicid, nick, avatar)
     }
@@ -237,13 +257,16 @@ class QQMusicApi(
      * [QrCode.key] 是 qrsig，用于 [checkQrCode] 轮询。
      */
     fun createQrCode(): QrCode {
-        loginJar.clear()
+        val session = LoginSession()
         // ptqrshow：拿二维码 + qrsig（最小流程，不做 initparams/xlogin）
-        val show = jarGet("https://ssl.ptlogin2.qq.com/ptqrshow", mapOf(
+        val show = jarGet(session, "https://ssl.ptlogin2.qq.com/ptqrshow", mapOf(
             "appid" to "716027609", "e" to "2", "l" to "M", "s" to "3", "d" to "72",
             "v" to "4", "t" to "0.$loginNonce", "daid" to "383", "pt_3rd_aid" to "100497308",
         ), "https://xui.ptlogin2.qq.com/")
-        val qrsig = loginJar["qrsig"] ?: throw MusicApiException("QQ：获取 qrsig 失败")
+        val qrsig = session.jar["qrsig"]
+            ?: throw MusicApiException("QQ：获取 qrsig 失败", null, MusicErrorKind.BAD_RESPONSE)
+        session.qrsig = qrsig
+        loginSession = session
         val dataUrl = "data:image/png;base64," + Base64.getEncoder().encodeToString(show.bytes)
         return QrCode(qrsig, dataUrl)
     }
@@ -251,9 +274,19 @@ class QQMusicApi(
     /**
      * 第二步：轮询二维码状态。返回 [QrLoginState.CONFIRMED] 时已完成登录，
      * [musicid]/[musicKey] 已写入。建议每 2~3 秒轮询一次。
+     *
+     * [qr] 已被新的 [createQrCode] 取代或已 [clearLogin] 时返回 [QrLoginState.EXPIRED]，
+     * 旧轮询线程据此退出，不会动到新二维码的会话。
      */
     fun checkQrCode(qr: QrCode): QrLoginState {
-        val resp = jarGet("https://ssl.ptlogin2.qq.com/ptqrlogin", mapOf(
+        val session = loginSession?.takeIf { it.qrsig == qr.key } ?: return QrLoginState.EXPIRED
+        synchronized(session) {
+            return checkQrCodeLocked(session, qr)
+        }
+    }
+
+    private fun checkQrCodeLocked(session: LoginSession, qr: QrCode): QrLoginState {
+        val resp = jarGet(session, "https://ssl.ptlogin2.qq.com/ptqrlogin", mapOf(
             "u1" to "https://graph.qq.com/oauth2.0/login_jump",
             "ptqrtoken" to QQHash.hash33(qr.key).toString(),
             "ptredirect" to "0", "h" to "1", "t" to "1", "g" to "1", "from_ui" to "1",
@@ -272,7 +305,7 @@ class QQMusicApi(
                 val sigx = SIGX_RE.find(url)?.groupValues?.get(1) ?: return QrLoginState.ERROR
                 val uin = UIN_RE.find(url)?.groupValues?.get(1) ?: return QrLoginState.ERROR
                 try {
-                    authorizeQq(uin, sigx)
+                    authorizeQq(session, uin, sigx)
                     QrLoginState.CONFIRMED
                 } catch (e: Exception) {
                     MusicLog.error("QQ 授权失败", e)
@@ -287,14 +320,14 @@ class QQMusicApi(
     }
 
     fun clearLogin() {
-        musicid = ""; musicKey = ""; loginJar.clear()
+        musicid = ""; musicKey = ""; loginSession = null
     }
 
     // ---- 登录收尾：check_sig → login_jump → authorize → code → qm_keyst ----
 
-    private fun authorizeQq(uin: String, sigx: String) {
+    private fun authorizeQq(session: LoginSession, uin: String, sigx: String) {
         // 4. check_sig（ptredirect=100 让它直接回 p_skey 而非跳转），单次 GET，跳空值合并
-        jarGet("https://ssl.ptlogin2.graph.qq.com/check_sig", mapOf(
+        jarGet(session, "https://ssl.ptlogin2.graph.qq.com/check_sig", mapOf(
             "uin" to uin, "pttype" to "1", "service" to "ptqrlogin", "nodirect" to "0",
             "ptsigx" to sigx, "s_url" to "https://graph.qq.com/oauth2.0/login_jump",
             "ptlang" to "2052", "ptredirect" to "100", "aid" to "716027609", "daid" to "383",
@@ -302,13 +335,13 @@ class QQMusicApi(
             "pt_login_type" to "3", "pt_aid" to "0", "pt_aaid" to "16", "pt_light" to "0",
             "pt_3rd_aid" to "100497308",
         ), "https://xui.ptlogin2.qq.com/").also {
-            MusicLog.info("QQ check_sig: status=${it.status}, setCookies=${it.setCookies.keys}, jar=${loginJar.keys}")
+            MusicLog.debug("QQ check_sig: status=${it.status}, setCookies=${it.setCookies.keys}, jar=${session.jar.keys}")
         }
-        val pSkey = loginJar["p_skey"] ?: throw MusicApiException("QQ：获取 p_skey 失败")
-        MusicLog.info("QQ authorize: jar=${loginJar.keys}")
+        val pSkey = session.jar["p_skey"] ?: throw MusicApiException("QQ：获取 p_skey 失败")
+        MusicLog.debug("QQ authorize: jar=${session.jar.keys}")
 
         // 5. authorize POST → 302 到带 code 的回调
-        val authorize = jarPostForm("https://graph.qq.com/oauth2.0/authorize", mapOf(
+        val authorize = jarPostForm(session, "https://graph.qq.com/oauth2.0/authorize", mapOf(
             "response_type" to "code", "client_id" to "100497308",
             "redirect_uri" to "https://y.qq.com/portal/wx_redirect.html?login_type=1&surl=https://y.qq.com/",
             "scope" to "get_user_info,get_app_friends", "state" to "state", "switch" to "", "from_ptlogin" to "1",
@@ -316,7 +349,7 @@ class QQMusicApi(
             "g_tk" to QQHash.hash33(pSkey, 5381).toString(),
             "auth_time" to loginNonce, "ui" to UUID.randomUUID().toString(),
         ), "https://graph.qq.com/")
-        val code = followForCode(authorize)
+        val code = followForCode(session, authorize)
 
         // QQLogin：code → musicid + musickey
         val data = musicu(
@@ -325,8 +358,8 @@ class QQMusicApi(
             param = mapOf("code" to code),
             extraComm = mapOf("tmeLoginType" to 2),
         )
-        musicid = data.get("musicid")?.takeIf { !it.isJsonNull }?.asString ?: ""
-        musicKey = data.get("musickey")?.takeIf { !it.isJsonNull }?.asString ?: ""
+        musicid = data.get("musicid").strOrNull() ?: ""
+        musicKey = data.get("musickey").strOrNull() ?: ""
         if (!loggedIn) throw MusicApiException("QQ：登录换取凭证失败")
     }
 
@@ -335,35 +368,35 @@ class QQMusicApi(
      * 这是登录成功的关键——否则后续请求的清除会把好好的会话 cookie 覆盖成空，
      * 导致 graph.qq.com 认为未登录、弹出 show?which=Login。
      */
-    private fun mergeIntoJar(setCookies: Map<String, String>) {
-        setCookies.forEach { (k, v) -> if (v.isNotEmpty()) loginJar[k] = v }
+    private fun mergeIntoJar(session: LoginSession, setCookies: Map<String, String>) {
+        setCookies.forEach { (k, v) -> if (v.isNotEmpty()) session.jar[k] = v }
     }
 
-    /** GET 并把响应 Set-Cookie 累积回共享 jar（模拟浏览器 Session，跳过空值）。 */
-    private fun jarGet(url: String, query: Map<String, String>, referer: String): MusicHttp.Response {
-        val r = http.get(url, query, headers = mapOf("Referer" to referer), cookies = loginJar)
-        mergeIntoJar(r.setCookies)
+    /** GET 并把响应 Set-Cookie 累积回会话 jar（模拟浏览器 Session，跳过空值）。 */
+    private fun jarGet(session: LoginSession, url: String, query: Map<String, String>, referer: String): MusicHttp.Response {
+        val r = http.get(url, query, headers = mapOf("Referer" to referer), cookies = session.jar)
+        mergeIntoJar(session, r.setCookies)
         return r
     }
 
-    private fun jarPostForm(url: String, form: Map<String, String>, referer: String): MusicHttp.Response {
-        val r = http.postForm(url, form, headers = mapOf("Referer" to referer), cookies = loginJar)
-        mergeIntoJar(r.setCookies)
+    private fun jarPostForm(session: LoginSession, url: String, form: Map<String, String>, referer: String): MusicHttp.Response {
+        val r = http.postForm(url, form, headers = mapOf("Referer" to referer), cookies = session.jar)
+        mergeIntoJar(session, r.setCookies)
         return r
     }
 
     /** 从 authorize 响应跟随重定向链，直到 Location/body 出现授权 code。 */
-    private fun followForCode(start: MusicHttp.Response): String {
+    private fun followForCode(session: LoginSession, start: MusicHttp.Response): String {
         var status = start.status
         var loc: String? = start.header("Location")
         var body = start.body
-        MusicLog.info("QQ authorize resp: status=${start.status}, firstLoc='${(loc ?: "").take(220)}'")
+        MusicLog.debug("QQ authorize resp: status=${start.status}, hasLocation=${loc != null}")
         CODE_RE.find(loc ?: "")?.let { return it.groupValues[1] }
 
         var hops = 0
         while (loc != null && hops < 6) {
             val url = if (loc.startsWith("http")) loc else "https://graph.qq.com$loc"
-            val r = jarGet(url, emptyMap(), "https://graph.qq.com/")
+            val r = jarGet(session, url, emptyMap(), "https://graph.qq.com/")
             status = r.status
             body = r.body
             loc = r.header("Location")
@@ -372,10 +405,9 @@ class QQMusicApi(
             hops++
         }
         val title = Regex("<title>(.*?)</title>", RegexOption.IGNORE_CASE).find(body)?.groupValues?.get(1) ?: ""
-        val bodyClean = body.replace(Regex("\\s+"), " ").take(400)
-        throw MusicApiException(
-            "QQ：获取授权 code 失败 (status=$status, title='$title', lastLoc='${(loc ?: "").take(160)}', body='$bodyClean')"
-        )
+        // 响应原文和跳转地址可能带会话参数，只进 debug 日志，不进异常信息（会被界面展示、随日志上传）
+        MusicLog.debug("QQ authorize 失败详情: lastLoc='${(loc ?: "").substringBefore('?')}', bodyLength=${body.length}")
+        throw MusicApiException("QQ：获取授权 code 失败 (status=$status, title='$title')")
     }
 
     // ---- 内部：musicu / musics 请求 ----
@@ -403,17 +435,21 @@ class QQMusicApi(
             headers = mapOf("Referer" to "https://y.qq.com/"),
             cookies = credentialCookies(),
         )
-        val json = gson.fromJson(resp.body, JsonObject::class.java)
-            ?: throw MusicApiException("QQ：响应解析失败 ($module.$method)")
-        val req = json.getAsJsonObject(reqKey) ?: throw MusicApiException("QQ：响应缺少 $reqKey")
-        val code = req.get("code")?.asInt ?: -1
-        if (code != 0) throw MusicApiException("QQ：接口返回 code=$code ($module.$method)")
+        val json = gson.parseObject(resp.body, "QQ $module.$method")
+        val req = json.objOrNull(reqKey)
+            ?: throw MusicApiException("QQ：响应缺少 $reqKey ($module.$method)", null, MusicErrorKind.BAD_RESPONSE)
+        val code = req.get("code").intOrNull() ?: -1
+        if (code != 0) {
+            // 1000 = 登录态失效（qm_keyst 过期）
+            val kind = if (code == 1000) MusicErrorKind.NOT_LOGGED_IN else MusicErrorKind.API_ERROR
+            throw MusicApiException("QQ：接口返回 code=$code ($module.$method)", null, kind, code)
+        }
         return req.objOrNull("data") ?: JsonObject()
     }
 
     /** vkey 请求：GET musicu.fcg?data=<payload>，payload 仅 req_0、无 comm、不签名。 */
     private fun vkeyRequest(param: Map<String, Any>): JsonObject {
-        MusicLog.info("QQ vkey req: cookies=${credentialCookies().keys}, keystPrefix='${musicKey.take(6)}' guid=$guid")
+        MusicLog.debug("QQ vkey req: loggedIn=$loggedIn")
         val payload = JsonObject().apply {
             add("req_0", gson.toJsonTree(mapOf("module" to "vkey.GetVkeyServer", "method" to "CgiGetVkey", "param" to param)))
         }
@@ -423,7 +459,7 @@ class QQMusicApi(
             headers = mapOf("Referer" to "https://y.qq.com/"),
             cookies = credentialCookies(),
         )
-        val json = gson.fromJson(resp.body, JsonObject::class.java) ?: return JsonObject()
+        val json = gson.parseObject(resp.body, "QQ vkey")
         return json.objOrNull("req_0")?.objOrNull("data") ?: JsonObject()
     }
 
@@ -450,11 +486,14 @@ class QQMusicApi(
         )
     }
 
+    private fun parseTracks(list: com.google.gson.JsonArray): List<Track> =
+        list.mapNotNull { el -> el.asObjOrNull()?.let { runCatching { parseTrack(it) }.getOrNull() } }
+
     private fun parseTrack(o: JsonObject): Track {
-        val mid = (o.get("mid") ?: o.get("songmid"))?.takeIf { !it.isJsonNull }?.asString
-        val id = (o.get("id") ?: o.get("songid"))?.takeIf { !it.isJsonNull }?.asString ?: (mid ?: "")
+        val mid = (o.get("mid") ?: o.get("songmid")).strOrNull()
+        val id = (o.get("id") ?: o.get("songid")).strOrNull() ?: (mid ?: "")
         val singers = o.arrOrNull("singer")
-            ?.mapNotNull { it.asJsonObject.get("name")?.asString }
+            ?.mapNotNull { it.asObjOrNull()?.get("name").strOrNull() }
             ?.joinToString(" / ") ?: ""
         val album = o.objOrNull("album")
         val albumName = album?.get("name")?.takeIf { !it.isJsonNull }?.asString
@@ -480,9 +519,9 @@ class QQMusicApi(
     }
 
     /** 每次读取都递增，避免依赖 System.currentTimeMillis 的可测试性；用于 t/action/_ 等抗缓存参数。 */
-    private var nonceCounter = 0L
+    private val nonceCounter = AtomicLong()
     private val loginNonce: String
-        get() = (System.currentTimeMillis() + nonceCounter++).toString()
+        get() = (System.currentTimeMillis() + nonceCounter.getAndIncrement()).toString()
 
     companion object {
         private val PTUI_CB = Regex("""ptuiCB\((.*?)\)""")

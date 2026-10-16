@@ -14,7 +14,11 @@ import top.fpsmaster.music.lyric.LyricParser
  * 登录态：二维码登录成功后 [cookie] 会被写入 `MUSIC_U`，之后的请求自动带上。
  * 高音质 / VIP 歌曲需要对应黑胶会员的登录 cookie，否则接口会回退或返回空链接。
  *
- * 线程安全性：单实例非并发安全，若并发使用请每线程一个实例或自行加锁。
+ * 线程安全性：[cookie] 的读写对多线程可见，登录成功后的 cookie 合并在实例锁内完成；
+ * 业务请求本身无共享可变状态，可以并发调用。
+ *
+ * 错误：所有方法失败时抛 [MusicApiException]，按 [MusicApiException.kind] 区分
+ * 未登录（code 301）、风控（-460/-462/405）、网络、超时、响应异常。
  */
 class NeteaseMusicApi(
     private val http: MusicHttp = MusicHttp(),
@@ -23,6 +27,7 @@ class NeteaseMusicApi(
     private val gson = Gson()
 
     /** 完整 cookie 串（如登录后持久化到磁盘再回填）。 */
+    @Volatile
     var cookie: String = initialCookie
 
     // ---- 公开 API ----
@@ -34,7 +39,7 @@ class NeteaseMusicApi(
             mapOf("s" to keyword, "type" to "1", "limit" to limit.toString(), "offset" to offset.toString(), "total" to "true"),
         )
         val songs = data.objOrNull("result")?.arrOrNull("songs") ?: return emptyList()
-        return songs.mapNotNull { runCatching { parseTrack(it.asJsonObject) }.getOrNull() }
+        return songs.mapNotNull { el -> el.asObjOrNull()?.let { runCatching { parseTrack(it) }.getOrNull() } }
     }
 
     /** 获取播放直链。 */
@@ -48,16 +53,16 @@ class NeteaseMusicApi(
             "/weapi/song/enhance/player/url/v1",
             mapOf("ids" to "[${track.id}]", "level" to level, "encodeType" to "flac"),
         )
-        val item = data.arrOrNull("data")?.firstOrNull()?.asJsonObject
+        val item = data.arrOrNull("data")?.firstOrNull().asObjOrNull()
             ?: return SongUrl(null, quality)
-        val url = item.get("url")?.takeIf { !it.isJsonNull }?.asString
-        val type = item.get("type")?.takeIf { !it.isJsonNull }?.asString ?: ""
-        val size = item.get("size")?.takeIf { !it.isJsonNull }?.asLong ?: 0
+        val url = item.get("url").strOrNull()
+        val type = item.get("type").strOrNull() ?: ""
+        val size = item.get("size").longOrNull() ?: 0
         // freeTrialInfo 非空 => 该链接是试听片段（start/end 单位为秒）
-        val trial = item.objOrNull("freeTrialInfo")?.takeIf { !it.isJsonNull }
+        val trial = item.objOrNull("freeTrialInfo")
         return if (trial != null) {
-            val start = trial.get("start")?.takeIf { !it.isJsonNull }?.asLong ?: 0
-            val end = trial.get("end")?.takeIf { !it.isJsonNull }?.asLong ?: 0
+            val start = trial.get("start").longOrNull() ?: 0
+            val end = trial.get("end").longOrNull() ?: 0
             SongUrl(url, quality, type, size, isTrial = true, trialStartMs = start * 1000, trialEndMs = end * 1000)
         } else {
             SongUrl(url, quality, type, size)
@@ -75,9 +80,9 @@ class NeteaseMusicApi(
             "/weapi/song/lyric",
             mapOf("id" to track.id, "lv" to "-1", "kv" to "-1", "tv" to "-1", "yv" to "-1"),
         )
-        val lrc = data.objOrNull("lrc")?.get("lyric")?.takeIf { !it.isJsonNull }?.asString ?: ""
-        val tlyric = data.objOrNull("tlyric")?.get("lyric")?.takeIf { !it.isJsonNull }?.asString?.ifBlank { null }
-        val yrc = data.objOrNull("yrc")?.get("lyric")?.takeIf { !it.isJsonNull }?.asString?.ifBlank { null }
+        val lrc = data.objOrNull("lrc")?.get("lyric").strOrNull() ?: ""
+        val tlyric = data.objOrNull("tlyric")?.get("lyric").strOrNull()?.ifBlank { null }
+        val yrc = data.objOrNull("yrc")?.get("lyric").strOrNull()?.ifBlank { null }
         return Lyric(lrc, tlyric, yrc, LyricParser.parse(lrc, tlyric, yrc))
     }
 
@@ -86,14 +91,16 @@ class NeteaseMusicApi(
     /** 第一步：创建二维码。用 [QrCode.qrContent]（一个 URL）渲染二维码图片。 */
     fun createQrCode(): QrCode {
         val keyData = weapi("/weapi/login/qrcode/unikey", mapOf("type" to "1"))
-        val unikey = keyData.get("unikey")?.asString
-            ?: throw MusicApiException("网易云：获取 unikey 失败")
+        val unikey = keyData.get("unikey").strOrNull()
+            ?: throw MusicApiException("网易云：获取 unikey 失败", null, MusicErrorKind.BAD_RESPONSE)
         return QrCode(unikey, "https://music.163.com/login?codekey=$unikey")
     }
 
     /**
      * 第二步：轮询二维码状态。返回 [QrLoginState.CONFIRMED] 时，登录 cookie 已写入 [cookie]。
      * 建议每 2~3 秒轮询一次。
+     *
+     * 响应无法解析时返回 [QrLoginState.ERROR]；网络失败抛 [MusicApiException]（[MusicErrorKind.NETWORK]/[MusicErrorKind.TIMEOUT]）。
      */
     fun checkQrCode(qr: QrCode): QrLoginState {
         val resp = http.postForm(
@@ -102,8 +109,13 @@ class NeteaseMusicApi(
             headers = baseHeaders(),
             cookies = buildCookies(cookie),
         )
-        val json = gson.fromJson(resp.body, JsonObject::class.java)
-        return when (json.get("code")?.asInt) {
+        val json = try {
+            gson.parseObject(resp.body, "网易云二维码状态")
+        } catch (e: MusicApiException) {
+            MusicLog.warn("网易云二维码状态无法解析: HTTP ${resp.status}")
+            return QrLoginState.ERROR
+        }
+        return when (json.get("code").intOrNull()) {
             803 -> {
                 captureCookies(resp.setCookies)
                 QrLoginState.CONFIRMED
@@ -115,17 +127,26 @@ class NeteaseMusicApi(
         }
     }
 
-    /** 是否已登录，返回用户 id（未登录为 null）。 */
+    /**
+     * 是否已登录，返回用户 id（未登录或 cookie 已失效为 null）。
+     *
+     * 宿主可以用它校验持久化回来的 cookie：返回 null 就应把界面切回未登录。
+     */
     fun getLoginUid(): Long? {
-        val data = weapi("/weapi/w/nuser/account/get", emptyMap())
-        return data.objOrNull("account")?.get("id")?.takeIf { !it.isJsonNull }?.asLong
+        val data = try {
+            weapi("/weapi/w/nuser/account/get", emptyMap())
+        } catch (e: MusicApiException) {
+            if (e.kind == MusicErrorKind.NOT_LOGGED_IN) return null
+            throw e
+        }
+        return data.objOrNull("account")?.get("id").longOrNull()
     }
 
     /** 每日推荐歌曲（需登录）。 */
     fun getDailyRecommendSongs(): List<Track> {
         val data = weapi("/weapi/v3/discovery/recommend/songs", emptyMap())
         val songs = data.objOrNull("data")?.arrOrNull("dailySongs") ?: return emptyList()
-        return songs.mapNotNull { runCatching { parseTrack(it.asJsonObject) }.getOrNull() }
+        return songs.mapNotNull { el -> el.asObjOrNull()?.let { runCatching { parseTrack(it) }.getOrNull() } }
     }
 
     /** 用户歌单列表（需登录）。 */
@@ -136,12 +157,12 @@ class NeteaseMusicApi(
         )
         val list = data.arrOrNull("playlist") ?: return emptyList()
         return list.mapNotNull {
-            val o = it.asJsonObject
+            val o = it.asObjOrNull() ?: return@mapNotNull null
             PlaylistBrief(
-                id = o.get("id")?.asString ?: return@mapNotNull null,
-                name = o.get("name")?.asString ?: "",
-                coverUrl = o.get("coverImgUrl")?.takeIf { c -> !c.isJsonNull }?.asString,
-                trackCount = o.get("trackCount")?.asInt ?: 0,
+                id = o.get("id").strOrNull() ?: return@mapNotNull null,
+                name = o.get("name").strOrNull() ?: "",
+                coverUrl = o.get("coverImgUrl").strOrNull(),
+                trackCount = o.get("trackCount").intOrNull() ?: 0,
             )
         }
     }
@@ -153,7 +174,7 @@ class NeteaseMusicApi(
             mapOf("id" to playlistId, "n" to limit.toString(), "s" to "8"),
         )
         val tracks = data.objOrNull("playlist")?.arrOrNull("tracks") ?: return emptyList()
-        return tracks.mapNotNull { runCatching { parseTrack(it.asJsonObject) }.getOrNull() }
+        return tracks.mapNotNull { el -> el.asObjOrNull()?.let { runCatching { parseTrack(it) }.getOrNull() } }
     }
 
     fun clearLogin() {
@@ -164,7 +185,7 @@ class NeteaseMusicApi(
 
     private fun parseTrack(o: JsonObject): Track {
         val artists = (o.arrOrNull("ar") ?: o.arrOrNull("artists"))
-            ?.mapNotNull { it.asJsonObject.get("name")?.asString }
+            ?.mapNotNull { it.asObjOrNull()?.get("name").strOrNull() }
             ?.joinToString(" / ") ?: ""
         val albumObj = o.objOrNull("al") ?: o.objOrNull("album")
         // fee: 0=免费, 1=VIP专享, 4=数字专辑(需购买), 8=免费低音质/高音质需VIP。
@@ -200,11 +221,17 @@ class NeteaseMusicApi(
         return RawResult(resp.body, resp.setCookies.entries.joinToString("; ") { "${it.key}=${it.value}" })
     }
 
-    /** 发一次 weapi 请求并返回响应 JSON。 */
+    /**
+     * 发一次 weapi 请求并返回响应 JSON。
+     *
+     * 网易云的业务错误是 HTTP 200 + body 里的 `code`（301 未登录、-460 风控……），
+     * 不检查就会把「登录过期」「被风控」当成空列表静默返回。这里统一翻成 [MusicApiException]。
+     */
     private fun weapi(path: String, params: Map<String, String>): JsonObject {
         val resp = postWeapi(path, params, buildCookies(cookie))
-        return gson.fromJson(resp.body, JsonObject::class.java)
-            ?: throw MusicApiException("网易云：响应解析失败 ($path)")
+        val json = gson.parseObject(resp.body, "网易云 $path")
+        checkNeteaseCode(json, path)
+        return json
     }
 
     private fun postWeapi(path: String, params: Map<String, String>, cookies: Map<String, String>): MusicHttp.Response =
@@ -231,6 +258,7 @@ class NeteaseMusicApi(
         return base
     }
 
+    @Synchronized
     private fun captureCookies(set: Map<String, String>) {
         // 至少需要 MUSIC_U；把新 cookie 合并进现有串
         val merged = LinkedHashMap<String, String>()
@@ -241,6 +269,24 @@ class NeteaseMusicApi(
         set.forEach { (k, v) -> merged[k] = v }
         cookie = merged.entries.joinToString("; ") { "${it.key}=${it.value}" }
     }
+}
+
+/**
+ * 把网易云 body 里的业务码翻成 [MusicApiException]。没有 `code` 字段的响应按成功处理。
+ */
+internal fun checkNeteaseCode(json: JsonObject, path: String) {
+    val code = json.get("code").intOrNull() ?: return
+    if (code == 200) return
+    val kind = when (code) {
+        301 -> MusicErrorKind.NOT_LOGGED_IN
+        -460, -461, -462, 405 -> MusicErrorKind.RISK_CONTROL
+        else -> MusicErrorKind.API_ERROR
+    }
+    val detail = (json.get("message").strOrNull() ?: json.get("msg").strOrNull())?.takeIf { it.isNotBlank() }
+    throw MusicApiException(
+        "网易云：接口返回 code=$code" + (detail?.let { "（$it）" } ?: "") + " ($path)",
+        null, kind, code,
+    )
 }
 
 /** 歌单摘要。 */
