@@ -53,6 +53,9 @@ class QQMusicApi(
     @Volatile
     private var loginSession: LoginSession? = null
 
+    /** 串行化"切换当前会话"与"凭证提交"：防止 clearLogin/新二维码 与旧轮询的写入交错。 */
+    private val loginLock = Any()
+
     // ---- 公开 API ----
 
     /** 搜索歌曲。走 musicu DoSearchForQQMusicDesktop（解析 body.song.list）。 */
@@ -266,7 +269,7 @@ class QQMusicApi(
         val qrsig = session.jar["qrsig"]
             ?: throw MusicApiException("QQ：获取 qrsig 失败", null, MusicErrorKind.BAD_RESPONSE)
         session.qrsig = qrsig
-        loginSession = session
+        synchronized(loginLock) { loginSession = session }
         val dataUrl = "data:image/png;base64," + Base64.getEncoder().encodeToString(show.bytes)
         return QrCode(qrsig, dataUrl)
     }
@@ -276,7 +279,8 @@ class QQMusicApi(
      * [musicid]/[musicKey] 已写入。建议每 2~3 秒轮询一次。
      *
      * [qr] 已被新的 [createQrCode] 取代或已 [clearLogin] 时返回 [QrLoginState.EXPIRED]，
-     * 旧轮询线程据此退出，不会动到新二维码的会话。
+     * 旧轮询线程据此退出，不会动到新二维码的会话。请求进行中才被取代也一样：
+     * 授权换到的凭证只在会话仍是当前会话时才写入，否则丢弃并返回 EXPIRED。
      */
     fun checkQrCode(qr: QrCode): QrLoginState {
         val session = loginSession?.takeIf { it.qrsig == qr.key } ?: return QrLoginState.EXPIRED
@@ -294,6 +298,8 @@ class QQMusicApi(
             "js_type" to "1", "login_sig" to "", "pt_uistyle" to "40", "aid" to "716027609",
             "daid" to "383", "pt_3rd_aid" to "100497308", "has_onekey" to "1",
         ), "https://xui.ptlogin2.qq.com/")
+        // 请求期间已被新二维码取代或被取消：结果不再属于当前会话
+        if (loginSession !== session) return QrLoginState.EXPIRED
         val args = PTUI_CB.find(resp.body)?.groupValues?.get(1)
             ?.let { PTUI_ARG.findAll(it).map { m -> m.groupValues[1] }.toList() }
             ?: return QrLoginState.ERROR
@@ -305,7 +311,12 @@ class QQMusicApi(
                 val sigx = SIGX_RE.find(url)?.groupValues?.get(1) ?: return QrLoginState.ERROR
                 val uin = UIN_RE.find(url)?.groupValues?.get(1) ?: return QrLoginState.ERROR
                 try {
-                    authorizeQq(session, uin, sigx)
+                    val (id, key) = authorizeQq(session, uin, sigx)
+                    // 授权要串行请求多次，期间用户可能取消/登出/刷新二维码：只有会话仍是当前会话才提交
+                    synchronized(loginLock) {
+                        if (loginSession !== session) return QrLoginState.EXPIRED
+                        musicid = id; musicKey = key
+                    }
                     QrLoginState.CONFIRMED
                 } catch (e: Exception) {
                     MusicLog.error("QQ 授权失败", e)
@@ -320,12 +331,13 @@ class QQMusicApi(
     }
 
     fun clearLogin() {
-        musicid = ""; musicKey = ""; loginSession = null
+        synchronized(loginLock) { musicid = ""; musicKey = ""; loginSession = null }
     }
 
     // ---- 登录收尾：check_sig → login_jump → authorize → code → qm_keyst ----
 
-    private fun authorizeQq(session: LoginSession, uin: String, sigx: String) {
+    /** 走完授权链，返回 (musicid, musickey)；不写字段，由调用方确认会话仍有效后提交。 */
+    private fun authorizeQq(session: LoginSession, uin: String, sigx: String): Pair<String, String> {
         // 4. check_sig（ptredirect=100 让它直接回 p_skey 而非跳转），单次 GET，跳空值合并
         jarGet(session, "https://ssl.ptlogin2.graph.qq.com/check_sig", mapOf(
             "uin" to uin, "pttype" to "1", "service" to "ptqrlogin", "nodirect" to "0",
@@ -358,9 +370,10 @@ class QQMusicApi(
             param = mapOf("code" to code),
             extraComm = mapOf("tmeLoginType" to 2),
         )
-        musicid = data.get("musicid").strOrNull() ?: ""
-        musicKey = data.get("musickey").strOrNull() ?: ""
-        if (!loggedIn) throw MusicApiException("QQ：登录换取凭证失败")
+        val id = data.get("musicid").strOrNull() ?: ""
+        val key = data.get("musickey").strOrNull() ?: ""
+        if (id.isEmpty() || key.isEmpty()) throw MusicApiException("QQ：登录换取凭证失败")
+        return id to key
     }
 
     /**

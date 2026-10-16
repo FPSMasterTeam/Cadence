@@ -18,11 +18,13 @@ import java.util.concurrent.TimeUnit
  * 特意关闭自动重定向（QQ 登录流程需要读取 302 的 Location 与 Set-Cookie），
  * 并暴露原始响应头，便于手动处理 cookie。
  *
+ * 类与请求方法为 open，便于测试替换网络层。
+ *
  * 失败一律抛 [MusicApiException]：网络错误为 [MusicErrorKind.NETWORK]，超过总时限为
  * [MusicErrorKind.TIMEOUT]，响应体超限为 [MusicErrorKind.BAD_RESPONSE]。HTTP 4xx/5xx 不算失败，
  * 照常返回 [Response] 由调用方按状态码处理。
  */
-class MusicHttp @JvmOverloads constructor(
+open class MusicHttp @JvmOverloads constructor(
     /** 建立 TCP/TLS 连接的超时。 */
     private val connectTimeoutMs: Int = 10_000,
     /** 两次 read 之间的最长间隔。 */
@@ -60,7 +62,7 @@ class MusicHttp @JvmOverloads constructor(
             headers.entries.firstOrNull { it.key.equals(name, true) }?.value?.firstOrNull()
     }
 
-    fun get(
+    open fun get(
         url: String,
         query: Map<String, String> = emptyMap(),
         headers: Map<String, String> = emptyMap(),
@@ -70,7 +72,7 @@ class MusicHttp @JvmOverloads constructor(
         return send(full, "GET", null, null, headers, cookies)
     }
 
-    fun postForm(
+    open fun postForm(
         url: String,
         form: Map<String, String>,
         headers: Map<String, String> = emptyMap(),
@@ -82,7 +84,7 @@ class MusicHttp @JvmOverloads constructor(
         headers = headers, cookies = cookies,
     )
 
-    fun postJson(
+    open fun postJson(
         url: String,
         json: String,
         query: Map<String, String> = emptyMap(),
